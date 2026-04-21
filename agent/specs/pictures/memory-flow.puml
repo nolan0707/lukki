@@ -1,0 +1,97 @@
+@startuml
+title Claude Code Memory Module - Runtime Flow
+
+skinparam shadowing false
+skinparam linetype ortho
+
+actor User
+participant "REPL / Query Loop" as Repl
+participant "constants/prompts.ts" as Prompts
+participant "memdir/memdir.ts\nloadMemoryPrompt()" as LoadPrompt
+participant "utils/claudemd.ts\ngetMemoryFiles()" as GetMemoryFiles
+participant "Main Agent" as Agent
+database "MEMORY.md" as MemoryIndex
+database "Topic Files" as TopicFiles
+database "Current Repo State" as CurrentState
+participant "query/stopHooks.ts" as StopHooks
+participant "extractMemories.ts" as Extract
+participant "autoDream.ts" as Dream
+participant "Forked Agent" as ForkedAgent
+database "Session Transcripts" as SessionTranscripts
+database "Daily Logs" as DailyLogs
+participant "teamMemorySync/watcher.ts" as TeamWatcher
+participant "teamMemorySync/index.ts" as TeamSync
+cloud "Remote Team Memory API" as TeamApi
+
+User -> Repl : user request
+Repl -> Prompts : build system prompt
+Prompts -> LoadPrompt : inject memory behavior
+Prompts -> GetMemoryFiles : inject MEMORY.md files
+GetMemoryFiles -> MemoryIndex : read private/team MEMORY.md
+LoadPrompt -> Agent : memory rules
+GetMemoryFiles -> Agent : MEMORY.md content
+
+Agent -> MemoryIndex : read index hooks
+alt recall or remember is explicitly requested
+  Agent -> TopicFiles : read matching topic files
+end
+
+alt recommendation depends on memory facts
+  Agent -> CurrentState : verify file / function / flag exists now
+  CurrentState --> Agent : current truth
+end
+
+alt user asks to remember or forget
+  Agent -> TopicFiles : create / update / delete topic file
+  Agent -> MemoryIndex : add / update / remove pointer
+end
+
+Agent -> StopHooks : turn completed
+StopHooks -> Extract : fire-and-forget extraction
+Extract -> Extract : check hasMemoryWritesSince()
+alt main agent already wrote memory
+  Extract --> StopHooks : skip duplicate write
+else main agent did not write memory
+  Extract -> ForkedAgent : run restricted extractor
+  ForkedAgent -> TopicFiles : write topic files
+  ForkedAgent -> MemoryIndex : update index
+end
+
+StopHooks -> Dream : async consolidation check
+Dream -> Dream : time gate
+Dream -> Dream : session gate
+alt gates passed
+  Dream -> ForkedAgent : run consolidation agent
+  ForkedAgent -> SessionTranscripts : grep recent sessions
+  ForkedAgent -> DailyLogs : read KAIROS logs if present
+  ForkedAgent -> TopicFiles : merge / prune / update
+  ForkedAgent -> MemoryIndex : re-index MEMORY.md
+else gates blocked
+  Dream --> StopHooks : do nothing
+end
+
+TeamWatcher -> TeamSync : initial pull / debounce push
+TeamSync -> TeamApi : GET / PUT
+TeamApi --> TeamSync : pull server wins, push upsert delta
+TeamSync -> TopicFiles : sync team memory files locally
+TeamSync -> MemoryIndex : sync team MEMORY.md locally
+
+note right of Agent
+Memory is not source of truth.
+Always verify recalled facts against current repo state.
+end note
+
+note right of Extract
+Extractor only supplements missed writes.
+It does not verify source code deeply.
+end note
+
+note right of Dream
+Dream is low-frequency consolidation:
+orient
+gather recent signal
+consolidate
+prune and index
+end note
+
+@enduml

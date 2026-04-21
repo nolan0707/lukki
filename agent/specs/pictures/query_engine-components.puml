@@ -1,0 +1,109 @@
+@startuml
+title QueryEngine Module - Component Diagram
+
+skinparam shadowing false
+skinparam linetype ortho
+skinparam packageStyle rectangle
+skinparam componentStyle rectangle
+
+actor "SDK / Remote Client / UI" as Client
+
+package "Session Harness" {
+  component "QueryEngine\nsrc/QueryEngine.ts" as QueryEngine
+  component "processUserInput()" as ProcessUserInput
+  component "fetchSystemPromptParts()" as PromptBuilder
+  component "normalizeMessage /\nresult aggregation" as SdkAdapter
+  component "recordTranscript /\nflushSessionStorage" as Transcript
+}
+
+package "Turn Harness" {
+  component "query()\nqueryLoop()\nsrc/query.ts" as QueryLoop
+  component "handleStopHooks()" as StopHooks
+  component "applyToolResultBudget()" as ToolBudget
+  component "getMessagesAfterCompactBoundary()" as BoundaryProjection
+}
+
+package "Context Management" {
+  component "microcompact()" as Microcompact
+  component "contextCollapse.applyCollapsesIfNeeded()" as Collapse
+  component "autocompact()" as Autocompact
+  component "reactiveCompact.tryReactiveCompact()" as ReactiveCompact
+  component "buildPostCompactMessages()" as PostCompact
+}
+
+package "Model Harness" {
+  component "queryModelWithStreaming()\nservices/api/claude.ts" as ClaudeStreaming
+  component "executeNonStreamingRequest()" as ClaudeFallback
+  component "withRetry()\nparamsFromContext()" as ApiRetry
+}
+
+package "Tool Harness" {
+  component "StreamingToolExecutor" as StreamingToolExecutor
+  component "runTools()\nservices/tools/toolOrchestration.ts" as ToolOrchestration
+  component "runToolUse()\nservices/tools/toolExecution.ts" as ToolExecution
+  component "canUseTool()" as PermissionGate
+  component "PostToolUse hooks /\ncontextModifier" as ToolHooks
+}
+
+database "Anthropic API" as Anthropic
+database "Session Transcript Store" as SessionStore
+
+Client --> QueryEngine : submitMessage()
+QueryEngine --> PromptBuilder : build system prompt
+QueryEngine --> ProcessUserInput : preprocess input
+QueryEngine --> QueryLoop : for await query(...)
+QueryEngine --> Transcript : persist messages
+QueryEngine --> SdkAdapter : emit SDKMessage / result
+Transcript --> SessionStore
+
+QueryLoop --> BoundaryProjection : project active context
+QueryLoop --> ToolBudget : limit tool_result size
+QueryLoop --> Microcompact
+QueryLoop --> Collapse
+QueryLoop --> Autocompact
+Autocompact --> PostCompact
+QueryLoop --> ReactiveCompact
+QueryLoop --> StopHooks
+
+QueryLoop --> ClaudeStreaming : model request / stream
+ClaudeStreaming --> ApiRetry : retry / params
+ClaudeStreaming --> ClaudeFallback : fallback on streaming failure
+ApiRetry --> Anthropic
+ClaudeFallback --> Anthropic
+
+QueryLoop --> StreamingToolExecutor : incremental tool execution
+QueryLoop --> ToolOrchestration : batched tool execution
+StreamingToolExecutor --> ToolExecution
+ToolOrchestration --> ToolExecution
+ToolExecution --> PermissionGate
+ToolExecution --> ToolHooks
+
+note right of QueryEngine
+Conversation-level harness.
+Owns persistent session state:
+mutableMessages
+permissionDenials
+usage
+readFileState
+end note
+
+note right of QueryLoop
+Turn-level state machine.
+Owns continuation, retry,
+tool follow-up and recovery.
+end note
+
+note right of ToolOrchestration
+Partitions tool_use blocks into:
+concurrency-safe batches
+or serial batches
+end note
+
+note bottom of PostCompact
+Generates compact_boundary and
+post-compact message set.
+QueryEngine then truncates old history.
+end note
+
+@enduml
+

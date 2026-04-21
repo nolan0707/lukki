@@ -1,0 +1,109 @@
+@startuml
+title Claude Code Memory Module - Overview
+
+skinparam shadowing false
+skinparam linetype ortho
+skinparam packageStyle rectangle
+skinparam componentStyle rectangle
+
+actor User
+actor "Main Agent" as MainAgent
+actor "Sub Agent" as SubAgent
+
+package "Prompt and Context Layer" {
+  component "constants/prompts.ts\nsystemPromptSection('memory')" as PromptSection
+  component "memdir/memdir.ts\nloadMemoryPrompt()\nbuildMemoryLines()" as Memdir
+  component "utils/claudemd.ts\ngetMemoryFiles()" as ClaudeMd
+  component "memdir/memoryTypes.ts\nmemory taxonomy\nrecall rules\ndrift caveat" as MemoryTypes
+  component "memdir/paths.ts\nisAutoMemoryEnabled()\ngetAutoMemPath()" as Paths
+}
+
+package "Persistent Memory Storage" {
+  folder "Auto Memory\n~/.claude/projects/<repo>/memory/" as AutoMem
+  folder "Team Memory\n<autoMem>/team/" as TeamMem
+  folder "Agent Memory\nuser / project / local" as AgentMem
+  file "MEMORY.md\nentry index" as EntryIndex
+  file "Topic Files\nuser / feedback /\nproject / reference" as TopicFiles
+  file "Daily Logs\nlogs/YYYY/MM/YYYY-MM-DD.md" as DailyLogs
+}
+
+package "Background Maintenance" {
+  component "query/stopHooks.ts\nturn-end trigger" as StopHooks
+  component "services/extractMemories/\nextractMemories.ts" as ExtractMemories
+  component "createAutoMemCanUseTool()\nwrite boundary guard" as ToolGuard
+  component "services/autoDream/\nautoDream.ts" as AutoDream
+  component "services/autoDream/\nconsolidationPrompt.ts" as DreamPrompt
+}
+
+package "Team Sync Subsystem" {
+  component "memdir/teamMemPaths.ts\nteam path validation" as TeamPaths
+  component "services/teamMemorySync/\nwatcher.ts" as TeamWatcher
+  component "services/teamMemorySync/\nindex.ts" as TeamSync
+  cloud "Remote Team Memory API" as TeamApi
+}
+
+package "Agent Memory Subsystem" {
+  component "tools/AgentTool/\nagentMemory.ts\ngetAgentMemoryDir()\nloadAgentMemoryPrompt()" as AgentMemoryTool
+}
+
+User --> MainAgent
+SubAgent --> AgentMemoryTool
+
+MainAgent --> PromptSection
+PromptSection --> Memdir
+PromptSection --> ClaudeMd
+Memdir --> MemoryTypes
+Memdir --> Paths
+
+ClaudeMd --> AutoMem : auto-load private MEMORY.md
+ClaudeMd --> TeamMem : auto-load team MEMORY.md
+Memdir --> AutoMem : memory prompt
+
+AgentMemoryTool --> AgentMem : resolve by scope
+AgentMemoryTool --> Memdir : inline agent memory prompt
+
+AutoMem --> EntryIndex
+AutoMem --> TopicFiles
+AutoMem --> DailyLogs
+TeamMem --> EntryIndex
+TeamMem --> TopicFiles
+AgentMem --> EntryIndex
+AgentMem --> TopicFiles
+
+StopHooks --> ExtractMemories
+StopHooks --> AutoDream
+ExtractMemories --> ToolGuard
+AutoDream --> DreamPrompt
+AutoDream --> ToolGuard
+
+TeamPaths --> TeamMem
+TeamWatcher --> TeamMem
+TeamWatcher --> TeamSync
+TeamSync --> TeamApi
+TeamApi --> TeamSync
+TeamSync --> TeamMem
+
+note right of MemoryTypes
+Allowed memory types:
+user
+feedback
+project
+reference
+
+Do not save code patterns,
+architecture, file paths,
+project structure, git history.
+end note
+
+note bottom of EntryIndex
+MEMORY.md is an index, not the body.
+It is auto-injected into context.
+Topic files are read on demand.
+end note
+
+note bottom of DailyLogs
+KAIROS mode writes new memory into daily logs first,
+then dream flow distills logs into topic files and MEMORY.md.
+end note
+
+@enduml

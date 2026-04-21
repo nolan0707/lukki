@@ -1,0 +1,134 @@
+@startuml
+title QueryEngine Module - Key Classes and Types
+
+skinparam shadowing false
+skinparam linetype ortho
+skinparam classAttributeIconSize 0
+
+class "QueryEngine\nsrc/QueryEngine.ts" as QueryEngine {
+  -config: QueryEngineConfig
+  -mutableMessages: Message[]
+  -abortController: AbortController
+  -permissionDenials: SDKPermissionDenial[]
+  -totalUsage: NonNullableUsage
+  -readFileState: FileStateCache
+  +submitMessage(prompt, options)
+  +interrupt()
+  +getMessages()
+  +getReadFileState()
+  +getSessionId()
+}
+
+class "QueryEngineConfig" as QueryEngineConfig {
+  +cwd
+  +commands
+  +tools
+  +mcpClients
+  +canUseTool
+  +getAppState()
+  +setAppState()
+  +handleElicitation
+  +readFileCache
+}
+
+class "QueryParams\nsrc/query.ts" as QueryParams {
+  +messages
+  +systemPrompt
+  +userContext
+  +systemContext
+  +toolUseContext
+  +canUseTool
+  +fallbackModel
+  +querySource
+  +maxTurns
+  +taskBudget
+}
+
+class "State\nqueryLoop local state" as QueryState {
+  +messages
+  +toolUseContext
+  +autoCompactTracking
+  +maxOutputTokensOverride
+  +maxOutputTokensRecoveryCount
+  +hasAttemptedReactiveCompact
+  +turnCount
+  +pendingToolUseSummary
+  +transition
+}
+
+class "StreamingToolExecutor" as StreamingToolExecutor {
+  +addTool(toolBlock, assistantMessage)
+  +getCompletedResults()
+  +getRemainingResults()
+  +discard()
+}
+
+class "Tool Orchestration" as ToolOrchestration {
+  +runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
+  -partitionToolCalls(toolUseBlocks, toolUseContext)
+}
+
+class "Tool Execution" as ToolExecution {
+  +runToolUse(toolUse, assistantMessage, canUseTool, toolUseContext)
+  -streamedCheckPermissionsAndCallTool(...)
+}
+
+class "Claude API Harness" as ClaudeHarness {
+  +queryModelWithStreaming(options)
+  +executeNonStreamingRequest(...)
+  -paramsFromContext(retryContext)
+}
+
+class "Compaction Services" as CompactServices {
+  +microcompact(messages, toolUseContext, querySource)
+  +autocompact(messages, toolUseContext, cacheSafeParams, querySource, tracking, snipTokensFreed)
+  +tryReactiveCompact(...)
+  +buildPostCompactMessages(result)
+}
+
+interface "CanUseToolFn" as CanUseToolFn
+interface "ToolUseContext" as ToolUseContext
+interface "Message" as Message
+interface "SDKMessage" as SDKMessage
+
+QueryEngine *-- QueryEngineConfig
+QueryEngine o-- Message : mutableMessages
+QueryEngine ..> SDKMessage : emits
+QueryEngine ..> QueryParams : builds
+QueryEngine ..> QueryState : consumes output stream from
+
+QueryParams *-- ToolUseContext
+QueryState *-- ToolUseContext
+QueryState o-- Message
+
+QueryEngine ..> ClaudeHarness
+QueryEngine ..> ToolOrchestration
+QueryEngine ..> CompactServices
+
+ToolOrchestration ..> ToolExecution
+ToolOrchestration ..> ToolUseContext
+ToolExecution ..> CanUseToolFn
+ToolExecution ..> ToolUseContext
+
+QueryEngine ..> CanUseToolFn : wraps for permissionDenials
+StreamingToolExecutor ..> ToolExecution
+ClaudeHarness ..> Message : yields assistant / stream_event
+
+note right of QueryEngine
+One QueryEngine per conversation.
+submitMessage() starts a new turn
+while reusing session state.
+end note
+
+note right of QueryState
+queryLoop keeps mutable cross-iteration state
+outside the immutable QueryParams.
+end note
+
+note bottom of CompactServices
+Compaction is not owned by QueryEngine.
+It is invoked by queryLoop as a dependency set.
+end note
+
+@enduml
+

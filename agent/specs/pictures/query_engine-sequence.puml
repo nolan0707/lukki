@@ -1,0 +1,104 @@
+@startuml
+title QueryEngine Module - Runtime Sequence Diagram
+
+skinparam shadowing false
+skinparam linetype ortho
+
+actor User
+participant "SDK / Client" as Client
+participant "QueryEngine.submitMessage()" as QE
+participant "processUserInput()" as Input
+participant "query()\nqueryLoop()" as QL
+participant "compact/*" as Compact
+participant "queryModelWithStreaming()" as Claude
+participant "StreamingToolExecutor /\nrunTools()" as Tools
+participant "runToolUse()" as ToolExec
+participant "canUseTool()" as Permission
+database "Anthropic API" as API
+database "Transcript Store" as Transcript
+
+User -> Client : submit prompt
+Client -> QE : submitMessage(prompt)
+QE -> Input : preprocess prompt / slash commands / attachments
+Input --> QE : user messages / allowed tools / model override
+QE -> Transcript : persist accepted user messages
+QE -> Client : system_init
+
+QE -> QL : query(messages, systemPrompt, toolUseContext)
+
+loop turn loop
+  QL -> Compact : getMessagesAfterCompactBoundary()
+  QL -> Compact : applyToolResultBudget()
+  QL -> Compact : microcompact()
+  QL -> Compact : context collapse
+  QL -> Compact : autocompact()
+
+  alt proactive compact happened
+    Compact --> QL : postCompactMessages + compact_boundary
+    QL --> QE : yielded compact messages
+    QE -> Transcript : record compact boundary
+    QE -> QE : truncate pre-boundary mutableMessages
+    QE -> Client : compact_boundary
+  end
+
+  QL -> Claude : query model with current context
+  Claude -> API : send streaming request
+
+  loop streaming response
+    API --> Claude : message_start / content_block_* / message_delta
+    Claude --> QL : assistant message / stream_event
+    QL --> QE : message stream
+    QE -> Transcript : persist assistant / user / boundary
+    QE -> Client : normalized SDKMessage
+  end
+
+  alt tool_use detected
+    QL -> Tools : execute tool batch
+
+    alt streaming tool execution
+      Tools -> ToolExec : run queued tools incrementally
+    else batched orchestration
+      Tools -> ToolExec : runToolUse() per block
+    end
+
+    ToolExec -> Permission : canUseTool()
+    Permission --> ToolExec : allow / deny / ask
+    ToolExec --> Tools : progress / tool_result / contextModifier
+    Tools --> QL : update.message + newContext
+    QL --> QE : progress / user(tool_result)
+    QE -> Transcript : persist tool_result
+    QE -> Client : user(tool_result)
+    QL -> QL : append toolResults to next request context
+  else no tool_use
+    QL -> QL : stop hooks / token budget / completion
+  end
+
+  alt prompt-too-long or media-size error
+    QL -> Compact : tryReactiveCompact()
+    Compact --> QL : postCompactMessages
+  end
+
+  alt max_output_tokens
+    QL -> QL : escalate tokens or inject resume meta message
+  end
+end
+
+QL --> QE : generator completed
+QE -> Transcript : flush pending writes
+QE -> Client : result(success | error_*)
+
+note right of QL
+Think-Act-Observe loop:
+think = model response
+act = tool execution
+observe = tool_result reinjection
+continue = next turn
+end note
+
+note right of QE
+SDK-facing async generator.
+Consumes internal message stream and
+normalizes it into SDK-visible output.
+end note
+
+@enduml
