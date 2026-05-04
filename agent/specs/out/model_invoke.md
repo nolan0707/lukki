@@ -23,7 +23,7 @@
 | 529 连续错误预算继承 | streaming 因 529 失败后切 non-streaming | 把 streaming 的一次 529 计入后续 non-streaming 的连续 529 预算。 | 保持“多少次过载后切模型”的策略一致。 |
 | 请求参数非流式裁剪 | fallback 到 non-streaming 且 `max_tokens` 过大 | 对 non-streaming 参数做 capped 调整，并同步修正 thinking budget。 | 满足 API 约束，避免 fallback 再因参数非法失败。 |
 
-## 错误与收尾
+## 错误响应
 
 | 策略类别 | 触发场景 | 处理策略 | 目的 |
 |---|---|---|---|
