@@ -558,7 +558,15 @@ type BuildClaudeSdkOptionsInput = {
 
 ## 14. Prompt 与 history 投影
 
-Claude SDK 原生会话拥有历史，OpenClaw 仍需要把当前 prompt 构建成稳定输入。
+Claude SDK 原生会话拥有自己的历史和压缩状态，OpenClaw context engine 拥有 OpenClaw 侧 transcript mirror、摘要、索引和上下文维护状态。两者是双轨上下文：
+
+```text
+Claude SDK session = 原生执行权威上下文
+OpenClaw transcript mirror = OpenClaw 可见历史和 context engine 输入
+OpenClaw context engine = prompt assembly / finalize / maintenance
+```
+
+Claude harness 不能把 OpenClaw transcript 当成 Claude 原生 session 的替代品，也不能在 resume turn 中重放完整 OpenClaw transcript。OpenClaw context engine 的输出只作为本轮 prompt projection 或 system/developer append 注入。
 
 History projection 策略：
 
@@ -567,6 +575,7 @@ History projection 策略：
 - 如果 OpenClaw context engine 启用，调用 `assembleHarnessContextEngine(...)`，把 assembly 的 user-visible context 合并进 prompt。
 - developer/system instructions 通过 `systemPrompt.append` 注入。
 - 不把完整 OpenClaw transcript 每轮重放给 SDK，避免和 Claude session store 双历史叠加。
+- context engine 生成的摘要、facts、外部记忆或新增关键上下文可以进入 prompt；完整历史不能进入 resume prompt。
 
 Fresh run 的 prompt 模板：
 
@@ -583,6 +592,8 @@ Resume run 的 prompt 模板：
 ```
 
 当 context engine 需要注入新 facts 时，通过 `before_prompt_build` hook 和 assembly result 控制。必须避免在 resume turn 每次塞入完整历史。
+
+Run 前的 assembly 只回答一个问题：本轮 Claude SDK query 除了当前用户 prompt 之外，还需要哪些 OpenClaw 可控上下文。它不改变 Claude SDK session store。
 
 ## 15. OpenClaw 工具桥详细设计
 
@@ -1084,7 +1095,13 @@ SDK 文档说明 optional dependency 可能缺失并抛 `Native CLI binary for <
 
 ## 28. Compaction
 
-Claude harness 必须把 Claude SDK compaction 事件接入 OpenClaw hook 生命周期。若 SDK 提供显式 compact/slash command/session API，`compact()` 使用该 API；若 SDK 只在 query 流中发出 `SDKCompactBoundaryMessage`，则 `compact()` 返回明确的 unsupported 结果，但事件投影仍必须完整运行 before/after compaction hook。
+Claude harness 必须把 Claude SDK compaction 事件接入 OpenClaw hook 生命周期，同时保持双轨压缩边界：
+
+- Claude SDK 原生 compaction 只压缩 Claude session 内部上下文。
+- OpenClaw context engine compaction/maintenance 只压缩 OpenClaw 侧 transcript mirror、摘要、索引和 context state。
+- 两边通过 harness 事件、hooks、diagnostics 和 prompt projection 同步，不互相直接写入内部存储。
+
+若 SDK 提供显式 compact/slash command/session API，`compact()` 使用该 API；若 SDK 只在 query 流中发出 `SDKCompactBoundaryMessage`，则 `compact()` 返回明确的 unsupported 结果，但事件投影仍必须完整运行 before/after compaction hook。
 
 Event projector 处理 `SDKCompactBoundaryMessage`：
 
@@ -1103,7 +1120,32 @@ Event projector 处理 `SDKCompactBoundaryMessage`：
 
 不要把 OpenClaw transcript 压缩结果写回 Claude SDK session，除非 SDK 提供官方接口。
 
+OpenClaw context engine 压缩路径：
+
+1. 用户或 runtime 触发 OpenClaw compact/maintenance。
+2. Claude harness 读取 OpenClaw mirrored transcript 和 context engine state。
+3. 调用 OpenClaw context engine maintenance/compaction，生成 OpenClaw 侧摘要、facts、索引或裁剪状态。
+4. 不修改 Claude SDK session store。
+5. 下一次 Claude run 的 assembly 只注入 context engine 认为必要的摘要/facts。
+
+原生 Claude compact 路径：
+
+1. Claude SDK 在 query 中自动 compact，或插件通过 SDK compact API 触发。
+2. Projector 收到 compact boundary。
+3. Harness 触发 OpenClaw before/after compaction hooks。
+4. 更新 binding metadata、diagnostics、trajectory。
+5. OpenClaw transcript mirror 保持用户可见历史，不跟随原生 compact 删除或重写。
+
+显式 compact 命令的结果必须区分两种状态：
+
+- `openclawContextCompacted: true/false`
+- `nativeClaudeSessionCompacted: true/false`
+
+如果 Claude SDK 不支持显式 native compact，但 OpenClaw context engine compact 成功，应返回类似“OpenClaw context compacted; Claude native session unchanged”的结构化结果。
+
 ## 29. Context engine
+
+OpenClaw context engine 是 Claude harness 中的 OpenClaw 侧上下文管理层。它由三个动作组成：prompt assembly、finalize、maintenance。
 
 集成点：
 
@@ -1112,11 +1154,89 @@ Event projector 处理 `SDKCompactBoundaryMessage`：
 - post-run：`finalizeHarnessContextEngineTurn(...)`
 - maintenance：`runHarnessContextEngineMaintenance`
 
+### 29.1 Prompt assembly
+
+Assembly 发生在 Claude SDK `query()` 前。
+
+目标：决定本轮要额外提供给 Claude 的 OpenClaw 可控上下文。
+
+输入：
+
+- 当前用户 prompt。
+- OpenClaw mirrored transcript。
+- context engine 已维护的摘要、facts、索引或 memory state。
+- bootstrap/workspace context。
+- 当前 provider/model、token budget、tool names、capability metadata。
+- session/channel/run metadata。
+
+输出：
+
+- 本轮最终 prompt projection。
+- system/developer instruction addition。
+- assembly 后的 messages 或 context facts。
+- prePromptMessageCount。
+- prompt cache metadata。
+
+Claude harness 使用方式：
+
+- Fresh run 可以把 assembly 生成的上下文和当前 prompt 一起交给 Claude。
+- Resume run 不能注入完整 transcript；只能注入新增且必要的 facts/summary。
+- Assembly 输出进入 `resolveAgentHarnessBeforePromptBuildResult(...)`，允许 OpenClaw hooks 再做最终改写。
+
+### 29.2 Finalize
+
+Finalize 发生在 Claude SDK terminal result、transcript mirror 和 event projection 之后。
+
+目标：让 OpenClaw context engine 吸收本轮 OpenClaw 可见结果，更新自己的上下文状态。
+
+输入：
+
+- 本轮是否成功、是否 abort/timeout、是否 promptError。
+- mirror 后的 messagesSnapshot。
+- assistantTexts、tool telemetry、usage、prompt cache。
+- sessionId/sessionKey/sessionFile、workspace、agent id。
+- compaction metadata。
+
+输出/副作用：
+
+- 更新 OpenClaw 侧摘要或 facts。
+- 记录哪些 transcript message 已进入 context state。
+- 更新 token budget/cache metadata。
+- 标记失败 turn 是否应排除在长期上下文之外。
+- 触发必要的 context engine maintenance。
+
+Claude harness 使用方式：
+
+- 只用 OpenClaw mirrored transcript 和 result finalize，不读取或修改 Claude SDK 内部 session JSONL。
+- 如果 Claude 原生 compact 在本轮发生，finalize 只记录 compact metadata，不试图反推出 Claude 内部压缩后的上下文。
+
+### 29.3 Maintenance
+
+Maintenance 是 OpenClaw 侧长期维护动作，可在 run 后、compact 后或后台任务中执行。
+
+目标：保持 OpenClaw context state 可控、紧凑、可检索。
+
+可能动作：
+
+- 压缩 OpenClaw transcript 摘要。
+- 清理过旧或重复 context records。
+- 更新 memory/index。
+- 合并重复 facts。
+- 修复损坏状态。
+- 维护 token budget 和 prompt cache metadata。
+
+Claude harness 使用方式：
+
+- Maintenance 不修改 Claude SDK session store。
+- Maintenance 产物只在后续 assembly 中作为摘要/facts 注入。
+- 如果 native Claude session 和 OpenClaw context state 对同一历史有不同压缩结果，以 Claude session 为原生执行权威，以 OpenClaw context state 为 OpenClaw 控制面权威。
+
 Context engine 策略：
 
 - Fresh run 使用 context engine assembly。
 - Resume run 不自动注入完整历史，只注入新增 contextual facts。
 - finalization 使用 mirror transcript 后的 messagesSnapshot。
+- maintenance 可以压缩 OpenClaw context state，但不删除 OpenClaw 用户可见 transcript，除非 OpenClaw session 管理层有明确策略。
 
 风险：
 
